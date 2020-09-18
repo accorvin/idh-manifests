@@ -1,0 +1,537 @@
+---
+apiVersion: image.openshift.io/v1
+kind: ImageStream
+metadata:
+  labels:
+    template: rsyslog-deployment-template
+  name: rsyslog
+
+---
+apiVersion: build.openshift.io/v1
+kind: BuildConfig
+metadata:
+  name: rsyslog-deployment
+  labels:
+    template: rsyslog-deployment-template
+spec:
+  output:
+    to:
+      kind: ImageStreamTag
+      name: rsyslog:latest
+  source:
+    git:
+      ref: master
+      uri: https://gitlab.cee.redhat.com/data-hub/dh-rsyslog.git
+  strategy:
+    type: Docker
+    dockerStrategy:
+      env:
+        - name: GIT_SSL_NO_VERIFY
+          value: 'true'
+  triggers:
+    - type: ConfigChange
+
+---
+apiVersion: v1
+kind: DeploymentConfig
+metadata:
+  labels:
+    app: rsyslog
+    rsyslog-name: ingestor
+  name: rsyslog-ingest
+spec:
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: rsyslog
+        rsyslog-name: ingestor
+      name: rsyslog-ingest
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: rsyslog-name
+                      operator: In
+                      values:
+                        - ingestor
+                topologyKey: kubernetes.io/hostname
+      volumes:
+        - name: kafka-cert
+          secret:
+            secretName: kafka-cert
+        - name: rsyslog-d
+          configMap:
+            default: 420
+            name: rsyslog-d-conf
+  triggers:
+    - type: ConfigChange
+    - type: ImageChange
+      imageChangeParams:
+        automatic: true
+        from:
+          kind: ImageStreamTag
+          name: rsyslog:latest
+        containerNames:
+          - rsyslog
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: rsyslog
+  name: rsyslog
+spec:
+  ports:
+    - name: tcp
+      port: 10514
+      protocol: TCP
+      targetPort: 10514
+  selector:
+    app: rsyslog
+    rsyslog-name: ingestor
+  sessionAffinity: None
+  type: ClusterIP
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: rsyslog
+  name: rsyslog-external
+spec:
+  externalTrafficPolicy: Cluster
+  ports:
+    - name: tcp
+      nodePort: 30514
+      port: 10514
+      protocol: TCP
+      targetPort: 10514
+    - name: udp
+      nodePort: 30514
+      port: 10514
+      protocol: UDP
+      targetPort: 10514
+  selector:
+    app: rsyslog
+    rsyslog-name: ingestor
+  sessionAffinity: None
+  type: NodePort
+
+---
+ apiVersion: v1
+ kind: ConfigMap
+ metadata:
+   name: rsyslog-d-conf
+ data:
+   00-load-modules-and-formatting.conf: |+
+     #### MODULES ####
+
+     # Emit internal rsyslog counters
+     module(load="impstats" format="cee" interval="60")
+
+     # Provides UDP syslog reception
+     module(load="imudp")
+     input(type="imudp" port="10514")
+
+     # Provides TCP syslog reception
+     module(load="imptcp")
+     input(type="imptcp" port="10514")
+
+     # ElasticSearch output module
+     module(load="omkafka")
+
+     # Parsing CEE JSON messages
+     module(load="mmjsonparse")
+
+     # Ensures we have UTF-8 encoded payloads
+     module(load="mmutf8fix")
+
+     #### RULES ####
+
+     # Ensure message is a properly formatted UTF-8 sequence
+     action(type="mmutf8fix" mode="utf-8")
+
+     # Parse any CEE JSON messages
+     action(type="mmjsonparse")
+
+   10-viaq-templates.conf: |
+     # Templates
+     #
+     # this is for index names to be like: logstash-YYYY.MM.DD
+     # WARNING: any rsyslog collecting host MUST be running UTC
+     #          if the proper index is to be chosen to hold the
+     #          log entry. If you are running EDT, e.g., then
+     #          the previous day's index will be chosen even
+     #          though the UTC value is the current day, because
+     #          the pattern logic does not convert "timereported"
+     #          to a UTC value before pulling data out of it.
+
+
+     template(name="viaq-index-pattern" type="list") {
+         constant(value="logstash-")
+         property(name="timereported" dateFormat="rfc3339" position.from="1" position.to="4")
+         constant(value=".")
+         property(name="timereported" dateFormat="rfc3339" position.from="6" position.to="7")
+         constant(value=".")
+         property(name="timereported" dateFormat="rfc3339" position.from="9" position.to="10")
+         }
+
+     # this is for formatting our syslog data in JSON with @timestamp using a "hierarchical" metdata namespace
+
+     template(name="com-redhat-rsyslog-hier"
+              type="list") {
+         constant(value="{")
+         constant(value="\"@timestamp\":\"")               property(name="timegenerated" dateFormat="rfc3339")
+         constant(value="\",\"message\":\"")               property(name="$.msg" format="json")
+         constant(value="\",\"hostname\":\"")              property(name="$.hostname")
+     #    constant(value="\",\"ipaddr4\":\"")               property(name="$.ipaddr4")
+         constant(value="\",\"level\":\"")                 property(name="$.level")
+         constant(value="\",\"pid\":\"")                   property(name="$.pid")
+         constant(value="\",\"tags\":\"")                  property(name="$.tags")
+         constant(value="\",\"service\":\"")               property(name="$.service")
+         constant(value="\",\"CEE\":")                     property(name="$!all-json")
+         constant(value=",\"systemd\":")                   property(name="$.systemd")
+         constant(value=",\"rsyslog\":")                   property(name="$.rsyslog")
+         constant(value=",\"pipeline_metadata\":")         property(name="$.pipeline_metadata")
+         constant(value="}\n")
+         }
+   20-viaq-pipeline-metadata.conf: |+
+     # Pipeline metadata related fields
+
+     # If there was some pipeline_metadata coming from the collector - we want to preserve it
+     if strlen($!pipeline_metadata) > 0 then {
+         set $.pipeline_metadata = $!pipeline_metadata;
+         unset $!pipeline_metadata;
+     }
+
+     # Add information about the normalizer
+     template(name="timegeneratedrfc3339" type="string" string="%timegenerated:::date-rfc3339%")
+     set $.pipeline_metadata!normalizer!received_at = exec_template("timegeneratedrfc3339");
+     set $.pipeline_metadata!normalizer!inputname = $inputname;
+     set $.pipeline_metadata!normalizer!name = "rsyslog-container-8.35";
+     set $.pipeline_metadata!version = "2018.05.18.0";
+
+
+   25-viaq-common.conf: |
+     # Populating top-level fields
+
+     # Now that we have parsed out any CEE JSON data in log messages, we have a CEE
+     # JSON tree with at least a "msg" field.  We proceed with normalizing the data
+     # to remove redundant pieces of information, and cleanup known bad data.
+
+     # The mmjsonparse action above has made sure the $!msg is always populated
+     # with $msg if initially unpopulated.
+     #
+     if (strlen($!msg) > 0) then {
+         set $.msg = $!msg;
+     } else {
+         if ($inputname == "impstats") then {
+             set $.msg = "pstats";
+         } else {
+             set $.msg = $msg;
+         }
+     }
+     if (strlen($!MESSAGE) > 0) and ($!MESSAGE != $.msg) then {
+         # Use the systemd message value when present.
+         # original_raw_message saves the original unparsed $msg in case $!MESSAGE from journald is not equal to $!msg
+         set $.msg = $!MESSAGE;
+         set $.pipeline_metadata!normalizer!original_raw_message = $msg;
+     }
+
+     # Always pull msg out of the message properties so that it does not show up
+     # again under the CEE property in ElasticSearch.
+     unset $!msg;
+     unset $!MESSAGE;
+
+     if ($!_HOSTNAME == $hostname) then {
+         unset $!_HOSTNAME;
+     }
+     set $.hostname = $hostname;
+
+     # If we don't have tags - we don't add new tags.
+     if (strlen($!tags) > 0) then {
+         set $.tags = $!tags;
+     }
+     # Always pull tags out of the message properties so that it does not show up
+     # again under the CEE property in ElasticSearch.
+     unset $!tags;
+
+     # We'll attempt to normalize the PID value we have from the default rsyslog
+     # properties with collected systemd properties below.
+     # $procid is the PID according to syslog rfc's
+     # Since this rsyslog instance is running in the container it doesn't have any local input, everything is from imptcp/imudp
+     set $.pid = $procid;
+
+     # $!pid and $!_PID might be coming from journald
+     if strlen($!pid) > 0 then {
+         # The imjournal normalized _PID to pid in its message properties. TODO: move PID to top level
+         set $.fwdpid = $!pid;
+     } else {
+         if strlen($!_PID) > 0 then {
+             set $.fwdpid = $!_PID;
+         }
+     }
+     unset $!_PID;
+     unset $!pid;
+
+     if strlen($.fwdpid) > 0 then {
+         if ($.pid == "-") and ($.fwdpid != "-") then {
+             # We don't have a PID, so use the one we found in the systemd data.
+             set $.pid = $.fwdpid;
+         } else {
+             if ($.pid != $.fwdpid) then {
+                 # We have a PID, but the systemd's PID is different, so be
+                 # sure to save it.
+                 set $.systemd!t!PID = $.fwdpid;
+             }
+         }
+     }
+
+     set $.level = $syslogseverity-text;
+
+     # if ipaddr4 was set by the collector we must preserve it.
+     if (strlen($!ipaddr4) > 0) then {
+         set $.ipaddr4 = $!ipaddr4;
+         unset $!ipaddr4;
+     } else if ($fromhost == $.hostname) then {
+         # iff fromhost == hostname we can set $.ipaddr4 as $.fromhost-ip
+         set $.ipaddr4 = $fromhost-ip;
+     }
+
+     # Now drop app-name if it is the same as programname, don't need to index
+     # both, and if either or both are still blank, just drop them entirely.
+     if (strlen($programname) > 0) then {
+         set $.service = $programname;
+      } else if (strlen($app-name) > 0) then {
+         set $.service = $app-name;
+     }
+
+     # if $.service == programname then we might need to save $app-name, if $.service == $app-name then it implies $.service == $programname OR $programname is empty
+     if ($.service != $app-name) then {
+         set $.rsyslog!appname=$app-name;
+     }
+     # If we unset, the output template will contain empty string
+     if (strlen($.service) == 0) then {
+         unset $.service;
+     }
+     if (strlen($.rsyslog!appname) == 0) then {
+         unset $.rsyslog!appname;
+     }
+   30-viaq-systemd.conf: |+
+     # systemd section processing
+
+     # pid normalization is in viaq-common
+
+     if strlen($!_MACHINE_ID) > 0 then {
+         # Pull out the systemd "user" and "trusted" journal fields.
+         #     # See http://www.freedesktop.org/software/systemd/man/systemd.journal-fields.html
+         #
+         #         # Pull out the systemd "user" journal fields...
+         set $.systemd!t!MACHINE_ID = $!_MACHINE_ID;
+         unset $!_MACHINE_ID;
+         if strlen($!CODE_FILE) > 0 then {
+             set $.systemd!u!CODE_FILE = $!CODE_FILE;
+         }
+         unset $!CODE_FILE;
+         if strlen($!CODE_FUNCTION) > 0 then {
+             set $.systemd!u!CODE_FUNCTION = $!CODE_FUNCTION;
+         }
+         unset $!CODE_FUNCTION;
+         if strlen($!CODE_LINE) > 0 then {
+             set $.systemd!u!CODE_LINE = $!CODE_LINE;
+         }
+         unset $!CODE_LINE;
+         if strlen($!ERRNO) > 0 then {
+             set $.systemd!u!ERRNO = $!ERRNO;
+         }
+         unset $!ERRNO;
+         if strlen($!MESSAGE_ID) > 0 then {
+             set $.systemd!u!MESSAGE_ID = $!MESSAGE_ID;
+         }
+         unset $!MESSAGE_ID;
+         if strlen($!RESULT) > 0 then {
+             set $.systemd!u!RESULT = $!RESULT;
+         }
+         unset $!RESULT;
+         if strlen($!UNIT) > 0 then {
+             set $.systemd!u!UNIT = $!UNIT;
+         }
+         unset $!UNIT;
+         unset $!PRIORITY;
+         unset $!SYSLOG_FACILITY;
+         unset $!SYSLOG_IDENTIFIER;
+         unset $!SYSLOG_PID;
+
+         # Pull out the systemd "trusted" journal fields...
+         if strlen($!_AUDIT_LOGINUID) > 0 then {
+             set $.systemd!t!AUDIT_LOGINUID = $!_AUDIT_LOGINUID;
+         }
+         unset $!_AUDIT_LOGINUID;
+         if strlen($!_AUDIT_SESSION) > 0 then {
+             set $.systemd!t!AUDIT_SESSION = $!_AUDIT_SESSION;
+         }
+         unset $!_AUDIT_SESSION;
+         if strlen($!_BOOT_ID) > 0 then {
+             set $.systemd!t!BOOT_ID = $!_BOOT_ID;
+         }
+         unset $!_BOOT_ID;
+         if strlen($!_CAP_EFFECTIVE) > 0 then {
+             set $.systemd!t!CAP_EFFECTIVE = $!_CAP_EFFECTIVE;
+         }
+         unset $!_CAP_EFFECTIVE;
+         if strlen($!_CMDLINE) > 0 then {
+             set $.systemd!t!CMDLINE = $!_CMDLINE;
+         }
+         unset $!_CMDLINE;
+         unset $!cmd;
+         if strlen($!_COMM) > 0 then {
+             set $.systemd!t!COMM = $!_COMM;
+         }
+         unset $!_COMM;
+         unset $!appname;
+         if strlen($!_EXE) > 0 then {
+             set $.systemd!t!EXE = $!_EXE;
+         }
+         unset $!_EXE;
+         unset $!exe;
+         if strlen($!_GID) > 0 then {
+             set $.systemd!t!GID = $!_GID;
+         }
+         unset $!_GID;
+         unset $!gid;
+         if strlen($!_HOSTNAME) > 0 then {
+             set $.systemd!t!HOSTNAME = $!_HOSTNAME;
+         }
+         unset $!_HOSTNAME;
+         if strlen($!_SELINUX_CONTEXT) > 0 then {
+             set $.systemd!t!SELINUX_CONTEXT = $!_SELINUX_CONTEXT;
+         }
+         unset $!_SELINUX_CONTEXT;
+         if strlen($!_SOURCE_REALTIME_TIMESTAMP) > 0 then {
+             set $.systemd!t!SOURCE_REALTIME_TIMESTAMP = $!_SOURCE_REALTIME_TIMESTAMP;
+         }
+         unset $!_SOURCE_REALTIME_TIMESTAMP;
+         if strlen($!_SYSTEMD_CGROUP) > 0 then {
+             set $.systemd!t!SYSTEMD_CGROUP = $!_SYSTEMD_CGROUP;
+         }
+         unset $!_SYSTEMD_CGROUP;
+         if strlen($!_SYSTEMD_OWNER_UID) > 0 then {
+             set $.systemd!t!SYSTEMD_OWNER_UID = $!_SYSTEMD_OWNER_UID;
+         }
+         unset $!_SYSTEMD_OWNER_UID;
+         if strlen($!_SYSTEMD_SESSION) > 0 then {
+             set $.systemd!t!SYSTEMD_SESSION = $!_SYSTEMD_SESSION;
+         }
+         unset $!_SYSTEMD_SESSION;
+         if strlen($!_SYSTEMD_SLICE) > 0 then {
+             set $.systemd!t!SYSTEMD_SLICE = $!_SYSTEMD_SLICE;
+         }
+         unset $!_SYSTEMD_SLICE;
+         if strlen($!_SYSTEMD_UNIT) > 0 then {
+             set $.systemd!t!SYSTEMD_UNIT = $!_SYSTEMD_UNIT;
+         }
+         unset $!_SYSTEMD_UNIT;
+         if strlen($!_SYSTEMD_USER_UNIT) > 0 then {
+             set $.systemd!t!SYSTEMD_USER_UNIT = $!_SYSTEMD_USER_UNIT;
+         }
+         unset $!_SYSTEMD_USER_UNIT;
+         if strlen($!_TRANSPORT) > 0 then {
+             set $.systemd!t!TRANSPORT = $!_TRANSPORT;
+         }
+         unset $!_TRANSPORT;
+         if strlen($!_UID) > 0 then {
+             set $.systemd!t!UID = $!_UID;
+         }
+         unset $!_UID;
+         unset $!uid;
+
+         # Pull out the systemd "kernel" journal fields...
+         if strlen($!_KERNEL_DEVICE) > 0 then {
+            set $.systemd!k!KERNEL_DEVICE = $!_KERNEL_DEVICE;
+         }
+         unset $!_KERNEL_DEVICE;
+         if strlen($!_KERNEL_SUBSYSTEM) > 0 then {
+            set $.systemd!k!KERNEL_SUBSYSTEM = $!_KERNEL_SUBSYSTEM;
+         }
+         unset $!_KERNEL_SUBSYSTEM;
+         if strlen($!_UDEV_SYSNAME) > 0 then {
+            set $.systemd!k!UDEV_SYSNAME = $!_UDEV_SYSNAME;
+         }
+         unset $!_UDEV_SYSNAME;
+         if strlen($!_UDEV_DEVNODE) > 0 then {
+            set $.systemd!k!UDEV_DEVNODE = $!_UDEV_DEVNODE;
+         }
+         unset $!_UDEV_DEVNODE;
+         if strlen($!_UDEV_DEVLINK) > 0 then {
+            set $.systemd!k!UDEV_DEVLINK = $!_UDEV_DEVLINK;
+         }
+         unset $!_UDEV_DEVLINK;
+     } else {
+         # Because of how we have defined the template above, where the template
+         # encodes the field name directly, we need to have an empty object for
+         # $.systemd so that at least an empty set of braces ("{}") is emitted.
+         # Without that, we don't have a valid JSON document to index.
+         #
+         # So to get that empty object whether or not we actually have systemd
+         # data to normalize we need to create an object hierarchy and then remove
+         # the leaf property.
+         set $.systemd!foo = "bar";
+         unset $.systemd!foo;
+     }
+
+
+
+
+
+
+   40-viaq-rsyslog-section.conf: |
+     # Rsyslog section in ElasticSearch mapping
+
+     # The facility is an rsyslog specific property defined to have a fixed set of
+     # values.
+     set $.rsyslog!facility = $syslogfacility-text;
+     # The following four properties are pulled from the RFC 5424 message, when
+     # available. If we don't have those kinds of messages, then the values are
+     # "-", and in the case of app-name, it will have the same value as
+     # programname.
+     set $.rsyslog!protocol-version = $protocol-version;
+     if (strlen($structured-data) > 0) and ($structured-data != "-") then {
+         set $.rsyslog!structured-data = $structured-data;
+     }
+     if (strlen($msgid) > 0) and ($msgid != "-") then {
+         set $.rsyslog!msgid = $msgid;
+     }
+     # The following four properities are derived by this instance of rsyslog (the
+     # last instance to touch the message before being indexed into ElasticSearch),
+     # and not sent across the wire.
+     if ($fromhost-ip != $.ipaddr4) then {
+         set $.rsyslog!fromhost-ip = $fromhost-ip;
+     }
+     if ($fromhost != $hostname) and ($fromhost != $fromhost-ip) then {
+         # We only report fromhost if it is different from hostname, and only if it
+         # tells us something more that fromhost-ip.
+         set $.rsyslog!fromhost = $fromhost;
+     }
+   50-kafka-output.conf: |2+
+
+     # Index into elasticsearch directly in a hierarchical metadata namespace
+     action(
+         type="omkafka"
+         broker=`echo $KAFKA_BROKER`
+         topic="dynamic-rsyslog-new"
+         template="com-redhat-rsyslog-hier"
+         partitions.auto="on"
+         confParam=["compression.codec=snappy",
+                    "socket.timeout.ms=5000",
+                    "request.timeout.ms=5000",
+                    "socket.keepalive.enable=true",
+                    "security.protocol=ssl",
+                    "ssl.ca.location=/etc/kafka/certs/ca.crt"])
